@@ -1,13 +1,13 @@
 #!/bin/bash
 # chat-backup.sh — AI Shell 聊天历史 + GLM Proxy 自动备份/恢复脚本
-REPO_URL="https://github.com/88lin/ai-shell-backup.git"
+REPO_URL="https://github.com/jing1312/devenv-chat-backup.git"
 REPO_MIRROR="https://ghfast.top/${REPO_URL}"
 REPO_DIR="/tmp/ai-shell-backup"
 LOCAL_DIR="/root/.huawei/hwcloud"
 SCRIPT_PATH="/root/chat-backup.sh"
 BACKUP_LOG="/var/log/chat-backup.log"
 PID_FILE="/var/run/chat-backup.pid"
-BACKUP_INTERVAL=3600
+BACKUP_INTERVAL=120
 GIT_TIMEOUT=120
 LOCK_DIR="/var/run/chat-backup.lock"
 STALE_LOCK_SEC=300
@@ -176,6 +176,16 @@ sync_to_repo() {
       echo "GLM Proxy PID: $(cat "$GLM_PROXY_PID_FILE" 2>/dev/null || echo 'N/A')"
       echo "CF Tunnel PID: $(cat "$CF_TUNNEL_PID_FILE" 2>/dev/null || echo 'N/A')"
     } > "$REPO_DIR/config/env-info.txt"
+
+    # Record backup date for selective restore
+    local _now; _now=$(date '+%Y-%m-%d %H:%M:%S')
+    local _today; _today=$(date '+%Y-%m-%d')
+    local _sess_cnt; _sess_cnt=$(find "$LOCAL_DIR/sessions" -name "*.jsonl" 2>/dev/null | wc -l)
+    local _rt_cnt; _rt_cnt=0
+    [ -f "$RUNTIME_DB" ] && _rt_cnt=$(sqlite3 "$RUNTIME_DB" "SELECT COUNT(*) FROM sessions;" 2>/dev/null || echo 0)
+    echo "$_today" > "$REPO_DIR/config/backup-date.txt"
+    printf '{"date":"%s","datetime":"%s","sessions":%s,"runtime_sessions":%s}\n' "$_today" "$_now" "$_sess_cnt" "$_rt_cnt" >> "$REPO_DIR/config/backup-history.jsonl"
+    log "BACKUP_DATE: recorded $_now ($_sess_cnt sessions, $_rt_cnt runtime)"
 }
 
 merge_session_db() {
@@ -467,6 +477,253 @@ do_full_restore() {
     start_cf_tunnel
     echo "Full restore complete!"
 }
+do_restore_date() {
+    local target_date="$1"
+    if [ -z "$target_date" ]; then
+        echo "Usage: $0 restore-date <YYYY-MM-DD|today|yesterday>"
+        echo "Example: $0 restore-date 2026-08-20"
+        echo "         $0 restore-date today"
+        echo "         $0 restore-date yesterday"
+        return 1
+    fi
+    # Resolve friendly names
+    case "$target_date" in
+        today)     target_date=$(date '+%Y-%m-%d') ;;
+        yesterday) target_date=$(date -d 'yesterday' '+%Y-%m-%d' 2>/dev/null || date -v-1d '+%Y-%m-%d' 2>/dev/null) ;;
+    esac
+    echo "=== Restore sessions from $target_date ==="
+    log "RESTORE_DATE: start for $target_date"
+
+    # Clone/pull backup repo
+    if [ ! -d "$REPO_DIR/.git" ]; then
+        git_sync_repo clone || { log "RESTORE_DATE: clone failed"; echo "ERROR: clone failed"; return 1; }
+    else
+        cd "$REPO_DIR" || true
+        local pull_url; pull_url=$(auth_url "$REPO_URL")
+        git remote set-url origin "$pull_url" 2>/dev/null
+        timeout "$GIT_TIMEOUT" git pull --depth 1 origin main 2>>"$BACKUP_LOG" || log "RESTORE_DATE: pull failed, using existing"
+        git remote set-url origin "$REPO_URL" 2>/dev/null
+    fi
+
+    local backup_db="$REPO_DIR/hwcloud-data/runtime-memory.db"
+    if [ ! -f "$backup_db" ]; then
+        echo "ERROR: backup runtime-memory.db not found in repo"
+        return 1
+    fi
+
+    mkdir -p "$RUNTIME_DB_DIR"
+    [ -f "$RUNTIME_DB" ] || { echo "Creating fresh runtime DB..."; cp -f "$backup_db" "$RUNTIME_DB"; }
+
+    # Use Python to selectively restore sessions by date
+    python3 - "$backup_db" "$RUNTIME_DB" "$target_date" "$BACKUP_LOG" << 'RESTORE_DATE_PY' 2>&1
+import sqlite3, sys, json, time, traceback
+from datetime import datetime
+
+backup_db_path, live_db_path, target_date, log_path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+
+def log(msg):
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    with open(log_path, "a") as f:
+        f.write("[%s] RESTORE_DATE: %s\n" % (ts, msg))
+        f.write("[%s] RESTORE_DATE: %s\n" % (ts, msg))
+    print("  %s" % msg)
+
+try:
+    # Open backup DB read-only
+    backup = sqlite3.connect("file:%s?mode=ro" % backup_db_path, uri=True, timeout=5)
+    bo = backup.cursor()
+
+    # Open live DB read-write
+    live = sqlite3.connect(live_db_path, timeout=10)
+    live.execute("PRAGMA journal_mode=WAL")
+    lo = live.cursor()
+
+    # Detect schema
+    bo.execute("PRAGMA table_info(sessions)")
+    b_cols = [r[1] for r in bo.fetchall()]
+    lo.execute("PRAGMA table_info(sessions)")
+    l_cols = [r[1] for r in lo.fetchall()]
+
+    if "id" in b_cols and "created_at" in b_cols:
+        b_sid_col, b_ts_col = "id", "created_at"
+    else:
+        b_sid_col, b_ts_col = "session_id", "start_timestamp"
+
+    if "id" in l_cols and "created_at" in l_cols:
+        l_sid_col, l_ts_col = "id", "created_at"
+    else:
+        l_sid_col, l_ts_col = "session_id", "start_timestamp"
+
+    log("backup schema: sid=%s, ts=%s" % (b_sid_col, b_ts_col))
+    log("live schema:   sid=%s, ts=%s" % (l_sid_col, l_ts_col))
+
+    # Find sessions matching the target date
+    if b_ts_col == "created_at":
+        bo.execute("SELECT %s, title, %s FROM sessions WHERE %s LIKE ?" % (b_sid_col, b_ts_col, b_ts_col),
+                   (target_date + "%",))
+    else:
+        # Old schema: start_timestamp is unix epoch, need to convert
+        import datetime as dt
+        start_ts = int(dt.datetime.strptime(target_date, "%Y-%m-%d").timestamp())
+        end_ts = start_ts + 86400
+        bo.execute("SELECT %s, title, %s FROM sessions WHERE %s >= ? AND %s < ?" % (b_sid_col, b_ts_col, b_ts_col, b_ts_col),
+                   (start_ts, end_ts))
+
+    matching = bo.fetchall()
+    log("found %d sessions matching %s" % (len(matching), target_date))
+
+    if not matching:
+        log("no sessions found for this date, nothing to restore")
+        backup.close()
+        live.close()
+        sys.exit(0)
+
+    # Get existing session IDs in live DB
+    lo.execute("SELECT %s FROM sessions" % l_sid_col)
+    existing = set(r[0] for r in lo.fetchall())
+
+    restored = 0
+    skipped = 0
+    for sid, title, ts in matching:
+        if sid in existing:
+            # Check if it has messages
+            lo.execute("SELECT COUNT(*) FROM messages WHERE session_id=?", (sid,))
+            if lo.fetchone()[0] > 0:
+                skipped += 1
+                log("  skip %s (already exists with messages)" % sid)
+                continue
+
+        # Get all columns for this session from backup
+        bo.execute("SELECT * FROM sessions WHERE %s=?" % b_sid_col, (sid,))
+        row = bo.fetchone()
+        if not row:
+            continue
+        col_names = b_cols
+        row_dict = dict(zip(col_names, row))
+
+        # Insert into live DB (handle schema differences)
+        if l_sid_col == "id" and "created_at" in l_cols:
+            # New schema
+            lo.execute("""INSERT OR IGNORE INTO sessions
+                (id, cwd, title, created_at, updated_at, additional_directories, meta)
+                VALUES (?,?,?,?,?,?,?)""",
+                (row_dict.get("id", sid),
+                 row_dict.get("cwd", "/root/workspace"),
+                 row_dict.get("title", title or "(no title)"),
+                 row_dict.get("created_at", ts),
+                 row_dict.get("updated_at", row_dict.get("created_at", ts)),
+                 row_dict.get("additional_directories", "[]"),
+                 row_dict.get("meta", '{}')))
+        else:
+            # Old schema - just copy all columns
+            placeholders = ",".join(["?"] * len(col_names))
+            lo.execute("INSERT OR IGNORE INTO sessions (%s) VALUES (%s)" % (",".join(col_names), placeholders), row)
+
+        # Copy messages for this session
+        bo.execute("SELECT * FROM messages WHERE session_id=?", (sid,))
+        msg_cols = [d[0] for d in bo.description]
+        msg_count = 0
+        for msg_row in bo.fetchall():
+            msg_dict = dict(zip(msg_cols, msg_row))
+            # Try to insert matching live schema
+            try:
+                if "content" in l_cols:
+                    # New schema messages table
+                    lo.execute("""INSERT OR IGNORE INTO messages
+                        (session_id, role, name, content, content_parts, tool_calls, tool_call_id, reasoning_content)
+                        VALUES (?,?,?,?,?,?,?,?)""",
+                        (msg_dict.get("session_id", sid),
+                         msg_dict.get("role", "assistant"),
+                         msg_dict.get("name", ""),
+                         msg_dict.get("content", ""),
+                         msg_dict.get("content_parts", ""),
+                         msg_dict.get("tool_calls", "[]"),
+                         msg_dict.get("tool_call_id", ""),
+                         msg_dict.get("reasoning_content", "")))
+                else:
+                    # Old schema - copy all columns
+                    m_placeholders = ",".join(["?"] * len(msg_cols))
+                    lo.execute("INSERT OR IGNORE INTO messages (%s) VALUES (%s)" % (",".join(msg_cols), m_placeholders), msg_row)
+                msg_count += 1
+            except Exception as e:
+                pass  # Skip duplicate or incompatible rows
+
+        restored += 1
+        log("  restored %s: %d messages (%s)" % (sid, msg_count, (title or "(no title)")[:40]))
+
+    live.commit()
+    backup.close()
+    live.close()
+    log("done: restored=%d, skipped=%d" % (restored, skipped))
+    print("")
+    print("=== Restore complete: %d sessions from %s ===" % (restored, target_date))
+except Exception as e:
+    log("FAILED: %s" % e)
+    traceback.print_exc()
+    print("ERROR: %s" % e)
+    sys.exit(1)
+RESTORE_DATE_PY
+}
+
+list_backup_dates() {
+    echo "=== Available backup dates ==="
+    if [ ! -d "$REPO_DIR/.git" ]; then
+        git_sync_repo clone || { echo "ERROR: cannot clone repo"; return 1; }
+    else
+        cd "$REPO_DIR" || true
+        local pull_url; pull_url=$(auth_url "$REPO_URL")
+        git remote set-url origin "$pull_url" 2>/dev/null
+        timeout "$GIT_TIMEOUT" git pull --depth 1 origin main 2>>"$BACKUP_LOG" || true
+        git remote set-url origin "$REPO_URL" 2>/dev/null
+    fi
+
+    if [ -f "$REPO_DIR/config/backup-history.jsonl" ]; then
+        echo ""
+        echo "Backup history (from backup-history.jsonl):"
+        python3 - "$REPO_DIR/config/backup-history.jsonl" << 'LIST_DATES_PY'
+import json, sys
+from collections import OrderedDict
+history_path = sys.argv[1]
+dates = OrderedDict()
+try:
+    with open(history_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line: continue
+            try:
+                d = json.loads(line)
+                dt = d.get("datetime", d.get("date", "?"))
+                sess = d.get("runtime_sessions", d.get("sessions", 0))
+                dates[d["date"]] = (dt, sess)
+            except: pass
+except: pass
+if not dates:
+    print("  (no history entries)")
+else:
+    print("  %-12s  %-20s  %s" % ("DATE", "LAST BACKUP", "SESSIONS"))
+    print("  %-12s  %-20s  %s" % ("----", "-----------", "--------"))
+    for date, (dt, sess) in dates.items():
+        print("  %-12s  %-20s  %d" % (date, dt, sess))
+    print("")
+    print("To restore a specific date:")
+    print("  bash /root/chat-backup.sh restore-date <DATE>")
+LIST_DATES_PY
+    else
+        echo "  No backup-history.jsonl found (older backups don't have this)"
+    fi
+
+    # Also show sessions by date from the runtime DB backup
+    local backup_db="$REPO_DIR/hwcloud-data/runtime-memory.db"
+    if [ -f "$backup_db" ]; then
+        echo ""
+        echo "Sessions by date (from runtime-memory.db):"
+        sqlite3 "file:$backup_db?mode=ro" "SELECT substr(created_at,1,10) as date, COUNT(*) as cnt, GROUP_CONCAT(substr(title,1,30), ' | ') FROM sessions GROUP BY date ORDER BY date DESC;" 2>/dev/null | while IFS='|' read -r date cnt titles; do
+            printf "  %-12s  %2d sessions  %s
+" "$date" "$cnt" "$titles"
+        done
+    fi
+}
+
 
 show_status() {
     echo "=== AI Shell Backup Status ==="
@@ -491,6 +748,8 @@ case "${1:-daemon}" in
     backup) do_backup ;;
     restore) do_restore ;;
     full-restore) do_full_restore ;;
+    restore-date) do_restore_date "$2" ;;
+    list-dates) list_backup_dates ;;
     status) show_status ;;
     daemon) run_daemon ;;
     start-glm) start_glm_proxy ;;
@@ -499,6 +758,8 @@ case "${1:-daemon}" in
        echo "  backup        - 立即备份一次"
        echo "  restore       - 从 GitHub 恢复数据"
        echo "  full-restore  - 恢复数据 + 启动 GLM Proxy + CF Tunnel"
+       echo "  restore-date <date> - 只恢复指定日期的会话 (如: restore-date 2026-08-20 或 today)"
+       echo "  list-dates    - 列出所有备份日期"
        echo "  status        - 查看状态"
        echo "  daemon        - 后台守护进程（默认，每 ${BACKUP_INTERVAL}s 备份一次）"
        echo "  start-glm     - 启动 GLM Proxy"
