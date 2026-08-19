@@ -466,6 +466,48 @@ sqlite3 /root/.huawei/hwcloud/memory.db \
   "SELECT message_count, substr(title,1,40) FROM sessions ORDER BY message_count DESC;"
 ```
 
+
+## 坑 21：cloudflared 下载不完整 = 损坏二进制 + SIGSEGV + 隧道起不来
+
+**现象**：`auto-restore.sh` STEP 3 报 `Failed to start`，`/tmp/cloudflared.log` 显示 `Permission denied` 或进程秒退。手动跑 `cloudflared --version` 返回 exit 139（SIGSEGV）。
+
+**根因**：`curl` 下载 cloudflared 二进制时网络中断或 GitHub 直连太慢，只下了一部分（实测 1.06MB / 完整 37.4MB）。旧代码只检查 `[ -s file ]`（文件非空），1MB 的半截文件通过了检查，`chmod +x` 后一执行就段错误。
+
+更隐蔽的是：**如果损坏的二进制已经在 PATH 里**，`command -v cloudflared` 返回成功，脚本根本不会重新下载，每次恢复都失败且无提示。
+
+**解决**：三层校验：
+1. 下载前先检测现有二进制能否 `--version`，不能跑就标记重新下载
+2. 下载后检查文件大小 > 10MB（cloudflared 完整约 35-40MB）
+3. `chmod +x` 后再跑一次 `--version` 验证能执行
+4. 直连失败自动回退 ghfast.top 镜像
+
+```bash
+# 修复后的下载逻辑（摘自 auto-restore.sh start_cf_tunnel）
+local cf_ok=false
+for url in "$cf_url" "https://ghfast.top/${cf_url}"; do
+    curl -fSL -o /usr/local/bin/cloudflared "$url" 2>/dev/null
+    local sz=0; [ -f /usr/local/bin/cloudflared ] && sz=$(stat -c %s /usr/local/bin/cloudflared 2>/dev/null || echo 0)
+    if [ "$sz" -gt 10485760 ]; then
+        chmod +x /usr/local/bin/cloudflared
+        if /usr/local/bin/cloudflared --version >/dev/null 2>&1; then
+            cf_ok=true; break
+        fi
+    fi
+done
+```
+
+### 验证
+
+```bash
+# 模拟损坏：截断 cloudflared
+head -c 1000000 /usr/local/bin/cloudflared > /tmp/bad_cf && cp /tmp/bad_cf /usr/local/bin/cloudflared
+chmod +x /usr/local/bin/cloudflared
+# 跑恢复，应自动检测损坏并重新下载
+bash /root/auto-restore.sh
+# 日志应显示 "existing cloudflared binary is broken" + "cloudflared ok"
+tail -20 /var/log/auto-restore.log
+```
+
 ---
 
 ## 经验总结

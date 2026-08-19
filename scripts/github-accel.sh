@@ -1,240 +1,163 @@
 #!/bin/bash
-# github-accel.sh - GitHub 全局加速方案
-# 当直连 GitHub 失败/超时时，自动切换到 tvv.tw 镜像
-# 
-# 用法: source github-accel.sh
-#   然后使用 gclone / gpull / gfetch / gpush 替代 git clone/pull/fetch/push
-#   或者直接用 ggit <subcommand> ... 自动加速
-#
-# 镜像支持: https://tvv.tw/
-#   git clone:  git clone https://tvv.tw/https://github.com/user/repo.git
-#   raw 文件:   https://tvv.tw/https://raw.githubusercontent.com/...
-#   release:    https://tvv.tw/https://github.com/.../releases/download/...
+# github-accel.sh — GitHub 加速脚本（镜像 + 代理）
+# 参考 devenv-chat-backup-skill 的 github-accel.sh
 
-GITHUB_MIRROR="https://tvv.tw"
-GITHUB_DIRECT_TIMEOUT=15   # 直连超时秒数（超时后切换镜像）
-GITHUB_PUSH_RETRIES=3      # push 重试次数
+GHACCEL_LOG="/var/log/github-accel.log"
+GHACCEL_PID_FILE="/var/run/github-accel.pid"
 
-# 检测 URL 是否为 GitHub URL
-_gh_is_github_url() {
-    case "$1" in
-        *github.com*|*raw.githubusercontent.com*|*gist.githubusercontent.com*|*api.github.com*)
-            return 0 ;;
-        *)
-            return 1 ;;
-    esac
-}
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$GHACCEL_LOG" 2>/dev/null; }
 
-# 给 GitHub URL 加上镜像前缀
-_gh_mirror_url() {
-    echo "${GITHUB_MIRROR}/$1"
-}
+# GitHub 镜像源列表
+MIRRORS=(
+    "https://ghfast.top/"
+    "https://ghproxy.com/"
+    "https://gh-proxy.com/"
+    "https://ghps.cc/"
+    "https://mirror.ghproxy.com/"
+)
 
-# 从 git remote URL 中提取 GitHub URL（去掉可能已有的 token）
-_gh_clean_url() {
-    local url="$1"
-    # 去掉 https://token@ 前缀中的 token
-    url=$(echo "$url" | sed 's|https://[^@]*@github.com|https://github.com|')
-    url=$(echo "$url" | sed 's|https://[^@]*@raw.githubusercontent.com|https://raw.githubusercontent.com|')
-    echo "$url"
-}
-
-# ============================================================
-# gclone: git clone with mirror fallback
-# 用法: gclone https://github.com/user/repo.git [target-dir]
-# ============================================================
-gclone() {
-    local url=""
-    local rest=()
-    local found_url=0
-
-    # 解析参数，找到 GitHub URL
-    for arg in "$@"; do
-        if [ $found_url -eq 0 ] && _gh_is_github_url "$arg"; then
-            url="$arg"
-            found_url=1
-        else
-            rest+=("$arg")
-        fi
-    done
-
-    if [ -z "$url" ]; then
-        git clone "$@"
-        return $?
-    fi
-
-    # 尝试直连（短超时）
-    printf "🔄 直连 GitHub (最多 %ss)...\n" "$GITHUB_DIRECT_TIMEOUT"
-    timeout "$GITHUB_DIRECT_TIMEOUT" git clone "$url" "${rest[@]}" 2>&1
-    local rc=$?
-    if [ $rc -eq 0 ]; then
+# 测试哪个镜像最快
+test_mirror() {
+    local mirror="$1"
+    local start_time end_time duration
+    start_time=$(date +%s%N)
+    if curl -sL -o /dev/null --connect-timeout 3 --max-time 5 "${mirror}https://github.com/git/git/raw/refs/heads/master/README.md" 2>/dev/null; then
+        end_time=$(date +%s%N)
+        duration=$(( (end_time - start_time) / 1000000 ))
+        echo "$duration"
         return 0
     fi
-
-    # 直连失败，切换镜像
-    printf "⚠️  直连失败(rc=%s)，切换镜像 %s...\n" "$rc" "$GITHUB_MIRROR"
-    local murl; murl=$(_gh_mirror_url "$url")
-    git clone "$murl" "${rest[@]}" 2>&1
-    local rc2=$?
-    if [ $rc2 -eq 0 ]; then
-        printf "✅ 镜像克隆成功\n"
-        # 修复 remote URL：把镜像 URL 改回原始 GitHub URL（后续 push 不走镜像）
-        local target=""
-        if [ ${#rest[@]} -gt 0 ]; then
-            target="${rest[0]}"
-        else
-            # 无 target dir 时，git 自动从 URL 推导目录名
-            target=$(basename "$url" .git)
-        fi
-        [ -d "$target/.git" ] && git -C "$target" remote set-url origin "$url" 2>/dev/null
-    else
-        printf "❌ 镜像也失败(rc=%s)\n" "$rc2"
-    fi
-    return $rc2
-}
-
-# ============================================================
-# gpull: git pull with mirror fallback
-# 用法: gpull [remote] [branch]  (在 git 仓库目录内执行)
-# ============================================================
-gpull() {
-    local remote="${1:-origin}"
-    local branch="${2:-}"
-
-    # 尝试直连
-    timeout "$GITHUB_DIRECT_TIMEOUT" git pull "$@" 2>&1
-    local rc=$?
-    if [ $rc -eq 0 ]; then
-        return 0
-    fi
-
-    # 直连失败，用镜像
-    printf "⚠️  git pull 直连失败(rc=%s)，尝试镜像...\n" "$rc"
-    local orig_url; orig_url=$(git remote get-url "$remote" 2>/dev/null)
-    if [ -z "$orig_url" ]; then
-        printf "❌ 找不到 remote '%s'\n" "$remote"
-        return 1
-    fi
-
-    if _gh_is_github_url "$orig_url"; then
-        local murl; murl=$(_gh_mirror_url "$(_gh_clean_url "$orig_url")")
-        git remote set-url "$remote" "$murl" 2>/dev/null
-        git pull "$@" 2>&1
-        rc=$?
-        # 恢复原始 URL
-        git remote set-url "$remote" "$orig_url" 2>/dev/null
-        if [ $rc -eq 0 ]; then
-            printf "✅ 镜像 pull 成功\n"
-        fi
-        return $rc
-    fi
-    return $rc
-}
-
-# ============================================================
-# gfetch: git fetch with mirror fallback
-# 用法: gfetch [remote] [branch]
-# ============================================================
-gfetch() {
-    local remote="${1:-origin}"
-
-    timeout "$GITHUB_DIRECT_TIMEOUT" git fetch "$@" 2>&1
-    local rc=$?
-    if [ $rc -eq 0 ]; then
-        return 0
-    fi
-
-    printf "⚠️  git fetch 直连失败(rc=%s)，尝试镜像...\n" "$rc"
-    local orig_url; orig_url=$(git remote get-url "$remote" 2>/dev/null)
-    if [ -z "$orig_url" ]; then
-        return 1
-    fi
-
-    if _gh_is_github_url "$orig_url"; then
-        local murl; murl=$(_gh_mirror_url "$(_gh_clean_url "$orig_url")")
-        git remote set-url "$remote" "$murl" 2>/dev/null
-        git fetch "$@" 2>&1
-        rc=$?
-        git remote set-url "$remote" "$orig_url" 2>/dev/null
-        return $rc
-    fi
-    return $rc
-}
-
-# ============================================================
-# gpush: git push with retry (镜像不支持 push，只能重试直连)
-# 用法: gpush [remote] [branch]
-# ============================================================
-gpush() {
-    local attempt=1
-    while [ $attempt -le $GITHUB_PUSH_RETRIES ]; do
-        printf "🔄 git push 尝试 %d/%d...\n" "$attempt" "$GITHUB_PUSH_RETRIES"
-        timeout 60 git push "$@" 2>&1
-        local rc=$?
-        if [ $rc -eq 0 ]; then
-            return 0
-        fi
-        printf "⚠️  push 失败(rc=%s)\n" "$rc"
-        attempt=$((attempt + 1))
-        [ $attempt -le $GITHUB_PUSH_RETRIES ] && sleep 3
-    done
-    printf "❌ push %d 次均失败\n" "$GITHUB_PUSH_RETRIES"
+    echo "999999"
     return 1
 }
 
-# ============================================================
-# graw: 下载 raw.githubusercontent.com 文件（带镜像回退）
-# 用法: graw https://raw.githubusercontent.com/user/repo/branch/file.sh -o local.sh
-#       graw https://raw.githubusercontent.com/user/repo/branch/file.sh  (输出到 stdout)
-# ============================================================
-graw() {
-    local url="$1"
-    local output=""
-    shift
-
-    while [ $# -gt 0 ]; do
-        case "$1" in
-            -o|--output) shift; output="$1" ;;
-        esac
-        shift
+# 找到最快的镜像
+find_fastest_mirror() {
+    local fastest="" fastest_time=999999
+    for mirror in "${MIRRORS[@]}"; do
+        local time; time=$(test_mirror "$mirror")
+        log "MIRROR: $mirror -> ${time}ms"
+        if [ "$time" -lt "$fastest_time" ]; then
+            fastest_time=$time
+            fastest="$mirror"
+        fi
     done
-
-    if [ -n "$output" ]; then
-        timeout "$GITHUB_DIRECT_TIMEOUT" curl -fsSL "$url" -o "$output" 2>/dev/null
-        if [ $? -eq 0 ] && [ -s "$output" ]; then
-            return 0
-        fi
-        printf "⚠️  直连失败，切换镜像...\n" >&2
-        local murl; murl=$(_gh_mirror_url "$url")
-        curl -fsSL "$murl" -o "$output" 2>/dev/null
-        return $?
-    else
-        timeout "$GITHUB_DIRECT_TIMEOUT" curl -fsSL "$url" 2>/dev/null
-        if [ $? -eq 0 ]; then
-            return 0
-        fi
-        local murl; murl=$(_gh_mirror_url "$url")
-        curl -fsSL "$murl" 2>/dev/null
-        return $?
+    if [ -n "$fastest" ] && [ "$fastest_time" -lt 999999 ]; then
+        echo "$fastest"
+        log "MIRROR: fastest = $fastest (${fastest_time}ms)"
+        return 0
     fi
+    log "MIRROR: all mirrors failed"
+    return 1
 }
 
-# ============================================================
-# ggit: 通用 git 命令加速器
-# 用法: ggit clone ...  → 自动用 gclone
-#       ggit pull ...   → 自动用 gpull
-#       ggit push ...   → 自动用 gpush
-#       ggit fetch ...  → 自动用 gfetch
-#       ggit other ...  → 直接执行 git other ...
-# ============================================================
-ggit() {
-    local subcmd="$1"
-    shift
-    case "$subcmd" in
-        clone)  gclone "$@" ;;
-        pull)   gpull "$@" ;;
-        push)   gpush "$@" ;;
-        fetch)  gfetch "$@" ;;
-        *)      git "$subcmd" "$@" ;;
-    esac
+# 加速 git clone
+accel_clone() {
+    local url="$1"
+    local target="${2:-$(basename "$url" .git)}"
+    
+    if [ -z "$url" ]; then
+        echo "Usage: $0 clone <url> [target]"
+        return 1
+    fi
+    
+    # 尝试直接 clone（可能已经够快）
+    local clone_err
+    log "CLONE: trying direct: $url"
+    clone_err=$(timeout 10 git clone --depth 1 "$url" "$target" 2>&1)
+    if [ $? -eq 0 ] && [ -d "$target/.git" ]; then
+        log "CLONE: direct success"
+        echo "Clone success (direct)"
+        return 0
+    fi
+    log "CLONE: direct failed: $(echo "$clone_err" | tail -1)"
+    
+    # 尝试镜像加速
+    local mirror; mirror=$(find_fastest_mirror)
+    if [ -n "$mirror" ]; then
+        local accel_url="${mirror}${url}"
+        log "CLONE: trying mirror: $accel_url"
+        clone_err=$(timeout 30 git clone --depth 1 "$accel_url" "$target" 2>&1)
+        if [ $? -eq 0 ] && [ -d "$target/.git" ]; then
+            log "CLONE: mirror success"
+            # 修正 remote URL
+            cd "$target" 2>/dev/null && git remote set-url origin "$url" 2>/dev/null
+            echo "Clone success (via $mirror)"
+            return 0
+        fi
+        log "CLONE: mirror failed: $(echo "$clone_err" | tail -1)"
+    fi
+    
+    log "CLONE: all methods failed"
+    echo "Clone failed: $(echo "$clone_err" | tail -1)"
+    return 1
 }
+
+# 加速 git pull
+accel_pull() {
+    local remote="${1:-origin}"
+    local branch="${2:-main}"
+    
+    # 获取当前 remote URL
+    local url; url=$(git remote get-url "$remote" 2>/dev/null)
+    if [ -z "$url" ]; then
+        echo "No remote '$remote' found"
+        return 1
+    fi
+    
+    local pull_err
+    log "PULL: trying direct: $url"
+    pull_err=$(timeout 15 git pull --depth 1 "$remote" "$branch" 2>&1)
+    if [ $? -eq 0 ]; then
+        log "PULL: direct success"
+        echo "Pull success (direct)"
+        return 0
+    fi
+    log "PULL: direct failed: $(echo "$pull_err" | tail -1)"
+    
+    # 尝试镜像
+    local mirror; mirror=$(find_fastest_mirror)
+    if [ -n "$mirror" ]; then
+        local accel_url="${mirror}${url}"
+        log "PULL: trying mirror: $accel_url"
+        pull_err=$(timeout 30 git pull --depth 1 "$accel_url" "$branch" 2>&1)
+        if [ $? -eq 0 ]; then
+            log "PULL: mirror success"
+            echo "Pull success (via $mirror)"
+            return 0
+        fi
+        log "PULL: mirror failed: $(echo "$pull_err" | tail -1)"
+    fi
+    
+    log "PULL: all methods failed"
+    echo "Pull failed: $(echo "$pull_err" | tail -1)"
+    return 1
+}
+
+# 配置 git 全局加速
+setup_git_config() {
+    # 设置 git 超时
+    git config --global http.lowSpeedLimit 1000 2>/dev/null
+    git config --global http.lowSpeedTime 10 2>/dev/null
+    git config --global http.postBuffer 524288000 2>/dev/null
+    
+    # 并发传输
+    git config --global http.maxRequests 5 2>/dev/null
+    
+    log "GIT_CONFIG: configured"
+    echo "Git config updated"
+}
+
+case "${1:-}" in
+    clone) shift; accel_clone "$@" ;;
+    pull) shift; accel_pull "$@" ;;
+    config) setup_git_config ;;
+    test) find_fastest_mirror ;;
+    *)
+        echo "Usage: $0 {clone <url> [target]|pull [remote] [branch]|config|test}"
+        echo "  clone  - 加速 git clone（自动选最快镜像）"
+        echo "  pull   - 加速 git pull（自动选最快镜像）"
+        echo "  config - 配置 git 全局加速参数"
+        echo "  test   - 测试所有镜像速度"
+        ;;
+esac

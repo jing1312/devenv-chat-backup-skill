@@ -370,6 +370,98 @@ sqlite3 /root/.ai/memory.db "SELECT COUNT(*) FROM messages;"
 
 ---
 
+## 坑 20：私有仓库 clone 无认证 + 错误被 2>/dev/null 吞掉 = 静默恢复失败
+
+### 现象
+
+容器重启后 `auto-restore.sh` 输出 `RESTORE: no data`，Sessions: 0。
+日志中没有错误信息，只有 `RESTORE: no data` 一行。`.git` 目录存在但为空。
+
+### 根因
+
+`chat-backup.sh` 的 `do_restore()` 和 `do_backup()` 中，git clone 命令使用 `REPO_MIRROR` 和 `REPO_URL` 但**不携带认证凭据**：
+
+```bash
+# ❌ 旧代码：私有仓库无 token，clone 失败
+timeout "$GIT_TIMEOUT" git clone --depth 1 "$REPO_MIRROR" "$REPO_DIR" 2>/dev/null
+```
+
+私有仓库需要 token 认证，但 URL 中没有 token。clone 失败后，`2>/dev/null` 把错误信息完全吞掉，脚本看不到失败原因，只看到 `hwcloud-data` 目录不存在 → 输出 `RESTORE: no data`。
+
+### 解决方案
+
+1. **新增 `GITHUB_TOKEN` 自动解析**：从环境变量 → `/tmp/github_token.txt` → `~/.git_token` 依次读取
+2. **新增 `auth_url()` 函数**：将 token 注入 GitHub URL（`https://x-access-token:TOKEN@github.com/...`）
+3. **新增 `git_sync_repo()` 函数**：依次尝试「认证镜像 → 认证直连 → 无认证镜像 → 无认证直连」，每次失败都记录错误日志
+4. **移除 `2>/dev/null`**：clone 错误改为 `2>>"$BACKUP_LOG"` 写入日志，不再静默吞掉
+
+### 配置方式
+
+```bash
+# 方式一：环境变量
+export GITHUB_TOKEN="ghp_xxxxxxxxxxxx"
+
+# 方式二：写入文件（推荐，容器重启后不丢失）
+echo "ghp_xxxxxxxxxxxx" > /tmp/github_token.txt
+
+# 方式三：home 目录文件
+echo "ghp_xxxxxxxxxxxx" > ~/.git_token
+```
+
+### 验证
+
+```bash
+# 设置 token 后执行恢复
+bash /root/chat-backup.sh restore
+# 日志应显示 "GIT: clone ok" 而非 "RESTORE: no data"
+tail -20 /var/log/chat-backup.log
+```
+
+## 坑 21：cloudflared 下载不完整 = 损坏二进制 + SIGSEGV + 隧道起不来
+
+**现象**：`auto-restore.sh` STEP 3 报 `Failed to start`，`/tmp/cloudflared.log` 显示 `Permission denied` 或进程秒退。手动跑 `cloudflared --version` 返回 exit 139（SIGSEGV）。
+
+**根因**：`curl` 下载 cloudflared 二进制时网络中断或 GitHub 直连太慢，只下了一部分（实测 1.06MB / 完整 37.4MB）。旧代码只检查 `[ -s file ]`（文件非空），1MB 的半截文件通过了检查，`chmod +x` 后一执行就段错误。
+
+更隐蔽的是：**如果损坏的二进制已经在 PATH 里**，`command -v cloudflared` 返回成功，脚本根本不会重新下载，每次恢复都失败且无提示。
+
+**解决**：三层校验：
+1. 下载前先检测现有二进制能否 `--version`，不能跑就标记重新下载
+2. 下载后检查文件大小 > 10MB（cloudflared 完整约 35-40MB）
+3. `chmod +x` 后再跑一次 `--version` 验证能执行
+4. 直连失败自动回退 ghfast.top 镜像
+
+```bash
+# 修复后的下载逻辑（摘自 auto-restore.sh start_cf_tunnel）
+local cf_ok=false
+for url in "$cf_url" "https://ghfast.top/${cf_url}"; do
+    curl -fSL -o /usr/local/bin/cloudflared "$url" 2>/dev/null
+    local sz=0; [ -f /usr/local/bin/cloudflared ] && sz=$(stat -c %s /usr/local/bin/cloudflared 2>/dev/null || echo 0)
+    if [ "$sz" -gt 10485760 ]; then
+        chmod +x /usr/local/bin/cloudflared
+        if /usr/local/bin/cloudflared --version >/dev/null 2>&1; then
+            cf_ok=true; break
+        fi
+    fi
+done
+```
+
+### 验证
+
+```bash
+# 模拟损坏：截断 cloudflared
+head -c 1000000 /usr/local/bin/cloudflared > /tmp/bad_cf && cp /tmp/bad_cf /usr/local/bin/cloudflared
+chmod +x /usr/local/bin/cloudflared
+# 跑恢复，应自动检测损坏并重新下载
+bash /root/auto-restore.sh
+# 日志应显示 "existing cloudflared binary is broken" + "cloudflared ok"
+tail -20 /var/log/auto-restore.log
+```
+
+
+
+---
+
 ## 经验总结
 
 1. **容器环境 ≠ 完整 Linux**：很多常用工具（rsync、crontab、curl 某些域名）可能不可用，要有替代方案
