@@ -7,7 +7,7 @@ LOCAL_DIR="/root/.huawei/hwcloud"
 SCRIPT_PATH="/root/chat-backup.sh"
 BACKUP_LOG="/var/log/chat-backup.log"
 PID_FILE="/var/run/chat-backup.pid"
-BACKUP_INTERVAL=120
+BACKUP_INTERVAL=30
 GIT_TIMEOUT=120
 LOCK_DIR="/var/run/chat-backup.lock"
 STALE_LOCK_SEC=300
@@ -311,8 +311,24 @@ do_backup() {
     timeout "$GIT_TIMEOUT" git commit -m "backup: $(date '+%Y-%m-%d %H:%M:%S') - $(find "$LOCAL_DIR/sessions" -name "*.jsonl" 2>/dev/null | wc -l) sessions" 2>/dev/null
     # Use auth URL for push
     git remote set-url origin "$pull_url" 2>/dev/null
-    local push_rc; timeout "$GIT_TIMEOUT" git push origin HEAD:main --force 2>>"$BACKUP_LOG" && push_rc=0 || push_rc=1
+    local push_rc=1
+    for attempt in 1 2; do
+        timeout "$GIT_TIMEOUT" git push origin HEAD:main --force 2>>"$BACKUP_LOG" && push_rc=0 && break
+        log "BACKUP: push attempt $attempt failed, $([ $attempt -eq 1 ] && echo 'retrying...' || echo 'giving up')"
+        [ $attempt -eq 1 ] && sleep 5
+    done
     git remote set-url origin "$REPO_URL" 2>/dev/null  # restore clean URL
+    # Post-backup verification: compare message counts
+    if [ $push_rc -eq 0 ] && [ -f "$RUNTIME_DB" ] && [ -f "$REPO_DIR/hwcloud-data/runtime-memory.db" ]; then
+        local _live_cnt _bk_cnt
+        _live_cnt=$(sqlite3 "$RUNTIME_DB" "SELECT COUNT(*) FROM messages;" 2>/dev/null || echo 0)
+        _bk_cnt=$(sqlite3 "$REPO_DIR/hwcloud-data/runtime-memory.db" "SELECT COUNT(*) FROM messages;" 2>/dev/null || echo 0)
+        if [ "$_live_cnt" != "$_bk_cnt" ]; then
+            log "BACKUP: ⚠️ message count mismatch! live=$_live_cnt backup=$_bk_cnt (gap will close on next cycle)"
+        else
+            log "BACKUP: ✅ verified live=$_live_cnt backup=$_bk_cnt"
+        fi
+    fi
     log "BACKUP: push $([ $push_rc -eq 0 ] && echo ok || echo fail)"; release_lock; return $push_rc
 }
 
@@ -585,13 +601,10 @@ try:
     restored = 0
     skipped = 0
     for sid, title, ts in matching:
-        if sid in existing:
-            # Check if it has messages
+        already_exists = sid in existing
+        if already_exists:
             lo.execute("SELECT COUNT(*) FROM messages WHERE session_id=?", (sid,))
-            if lo.fetchone()[0] > 0:
-                skipped += 1
-                log("  skip %s (already exists with messages)" % sid)
-                continue
+            live_msg_cnt = lo.fetchone()[0]
 
         # Get all columns for this session from backup
         bo.execute("SELECT * FROM sessions WHERE %s=?" % b_sid_col, (sid,))
@@ -649,7 +662,10 @@ try:
                 pass  # Skip duplicate or incompatible rows
 
         restored += 1
-        log("  restored %s: %d messages (%s)" % (sid, msg_count, (title or "(no title)")[:40]))
+        if already_exists:
+            log("  merged %s: +%d new messages (total %d) (%s)" % (sid, msg_count, live_msg_cnt + msg_count, (title or "(no title)")[:40]))
+        else:
+            log("  restored %s: %d messages (%s)" % (sid, msg_count, (title or "(no title)")[:40]))
 
     live.commit()
     backup.close()
