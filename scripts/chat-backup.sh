@@ -85,54 +85,72 @@ sqlite_backup() {
 }
 
 generate_session_index() {
-    local sessions_dir="$LOCAL_DIR/sessions"
-    [ -d "$sessions_dir" ] || return 0
     local index_md="$REPO_DIR/hwcloud-data/sessions-index.md"
     local index_json="$REPO_DIR/hwcloud-data/sessions-index.json"
     local db_path="$LOCAL_DIR/memory.db"
-    python3 - "$sessions_dir" "$index_md" "$index_json" "$db_path" << 'PYEOF' 2>>/var/log/chat-backup.log
-import json, os, glob, sys, sqlite3
+    [ -f "$db_path" ] || { log "INDEX: no memory.db, skipping"; return 0; }
+    python3 - "$index_md" "$index_json" "$db_path" << 'PYEOF' 2>>/var/log/chat-backup.log
+import json, sys, sqlite3
 from datetime import datetime
-sessions_dir, index_md, index_json, db_path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
-db_times = {}
+index_md, index_json, db_path = sys.argv[1], sys.argv[2], sys.argv[3]
+entries = []
 try:
     conn = sqlite3.connect("file:%s?mode=ro" % db_path, uri=True, timeout=3)
     cur = conn.cursor()
+    # Detect schema: new (id, created_at, title) vs old (session_id, start_timestamp)
     cur.execute("PRAGMA table_info(sessions)")
-    col_names = [r[1] for r in cur.fetchall()]
-    if "id" in col_names and "session_id" not in col_names:
-        sid_col, ts_col = "id", "created_at"
+    s_cols = [r[1] for r in cur.fetchall()]
+    if "id" in s_cols and "session_id" not in s_cols:
+        sid_col, ts_col, title_col = "id", "created_at", "title"
     else:
-        sid_col, ts_col = "session_id", "start_timestamp"
-    cur.execute("SELECT %s, %s FROM sessions" % (sid_col, ts_col))
+        sid_col, ts_col, title_col = "session_id", "start_timestamp", "title"
+    # Detect messages schema
+    cur.execute("PRAGMA table_info(messages)")
+    m_cols = [r[1] for r in cur.fetchall()]
+    msg_sid_col = "session_id" if "session_id" in m_cols else "SessionID"
+    msg_role_col = "role" if "role" in m_cols else "Role"
+    msg_content_col = "content" if "content" in m_cols else ("content_json" if "content_json" in m_cols else "Content")
+    # Query all sessions
+    has_title = title_col in s_cols
+    if has_title:
+        cur.execute("SELECT %s, %s, %s FROM sessions" % (sid_col, ts_col, title_col))
+    else:
+        cur.execute("SELECT %s, %s, '' FROM sessions" % (sid_col, ts_col))
     for row in cur.fetchall():
-        sid, ts = row[0], row[1]
+        sid, ts, title = row[0], row[1], (row[2] or "")
+        # Format timestamp
         if ts:
             if isinstance(ts, (int, float)):
-                db_times[sid] = datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M')
+                time_str = datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M')
             else:
-                db_times[sid] = str(ts)[:16]
+                time_str = str(ts)[:16]
+        else:
+            time_str = ""
+        # Count messages for this session
+        cur.execute("SELECT COUNT(*) FROM messages WHERE %s=?" % msg_sid_col, (sid,))
+        msg_count = cur.fetchone()[0]
+        # If no title, try to get first user message as title
+        if not title:
+            try:
+                cur.execute("SELECT %s FROM messages WHERE %s=? AND %s='user' LIMIT 1" % (msg_content_col, msg_sid_col, msg_role_col), (sid,))
+                r = cur.fetchone()
+                if r and r[0]:
+                    try:
+                        # content might be JSON
+                        c = json.loads(r[0])
+                        if isinstance(c, dict):
+                            title = (c.get("Content") or c.get("content") or str(c))[:80]
+                        else:
+                            title = str(c)[:80]
+                    except:
+                        title = str(r[0])[:80]
+                    title = title.replace('\n', ' ').strip()
+            except:
+                pass
+        entries.append({"id": sid, "title": title or "(空会话)", "date": time_str, "messages": msg_count, "size": 0})
     conn.close()
 except Exception as e:
     sys.stderr.write("INDEX: db query failed: %s\n" % e)
-files = sorted(glob.glob(os.path.join(sessions_dir, "*.jsonl")), key=lambda f: os.path.getmtime(f))
-entries = []
-for f in files:
-    sid = os.path.basename(f).replace('.jsonl', '')
-    time_str = db_times.get(sid, datetime.fromtimestamp(os.path.getmtime(f)).strftime('%Y-%m-%d %H:%M'))
-    size = os.path.getsize(f)
-    title = "(空会话)"; msg_count = 0; first_user_msg = ""
-    with open(f, 'r', encoding='utf-8', errors='replace') as fh:
-        for line in fh:
-            line = line.strip()
-            if not line: continue
-            try:
-                d = json.loads(line); msg_count += 1
-                if d.get("Role") == 0 and d.get("Content") and not first_user_msg:
-                    first_user_msg = d["Content"][:80].replace('\n', ' ').strip()
-            except: continue
-    if first_user_msg: title = first_user_msg
-    entries.append({"id": sid, "title": title, "date": time_str, "messages": msg_count, "size": size})
 entries.sort(key=lambda e: e["date"])
 with open(index_md, 'w', encoding='utf-8') as f:
     f.write("# 会话索引（共 %d 个会话）\n\n生成时间：%s\n\n" % (len(entries), datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
@@ -141,7 +159,7 @@ with open(index_md, 'w', encoding='utf-8') as f:
         f.write("| %d | %s | %d | %s | `%s` |\n" % (i, e['date'], e['messages'], e['title'], e['id']))
 with open(index_json, 'w', encoding='utf-8') as f: json.dump(entries, f, ensure_ascii=False, indent=2)
 PYEOF
-    log "INDEX: generated"
+    log "INDEX: generated (%d sessions)" "$(sqlite3 "$db_path" "SELECT COUNT(*) FROM sessions;" 2>/dev/null || echo 0)"
 }
 
 sync_to_repo() {
@@ -172,7 +190,7 @@ sync_to_repo() {
     [ -d /root/.agents/skills ] && ls /root/.agents/skills/ > "$REPO_DIR/config/installed-skills.txt" 2>/dev/null
     { echo "=== AI Shell Backup Snapshot ==="; echo "Date: $(date)"; echo "Hostname: $(hostname)"
       echo "OS: $(cat /etc/os-release 2>/dev/null | head -1)"
-      echo "Sessions: $(find "$LOCAL_DIR/sessions" -name "*.jsonl" 2>/dev/null | wc -l)"
+      echo "Sessions: $(sqlite3 "$LOCAL_DIR/memory.db" "SELECT COUNT(*) FROM sessions;" 2>/dev/null || echo 0)"
       echo "GLM Proxy PID: $(cat "$GLM_PROXY_PID_FILE" 2>/dev/null || echo 'N/A')"
       echo "CF Tunnel PID: $(cat "$CF_TUNNEL_PID_FILE" 2>/dev/null || echo 'N/A')"
     } > "$REPO_DIR/config/env-info.txt"
@@ -180,7 +198,7 @@ sync_to_repo() {
     # Record backup date for selective restore
     local _now; _now=$(date '+%Y-%m-%d %H:%M:%S')
     local _today; _today=$(date '+%Y-%m-%d')
-    local _sess_cnt; _sess_cnt=$(find "$LOCAL_DIR/sessions" -name "*.jsonl" 2>/dev/null | wc -l)
+    local _sess_cnt; _sess_cnt=$(sqlite3 "$LOCAL_DIR/memory.db" "SELECT COUNT(*) FROM sessions;" 2>/dev/null || echo 0)
     local _rt_cnt; _rt_cnt=0
     [ -f "$RUNTIME_DB" ] && _rt_cnt=$(sqlite3 "$RUNTIME_DB" "SELECT COUNT(*) FROM sessions;" 2>/dev/null || echo 0)
     echo "$_today" > "$REPO_DIR/config/backup-date.txt"
@@ -308,7 +326,7 @@ do_backup() {
     timeout "$GIT_TIMEOUT" git add -A 2>/dev/null
     local changes; changes=$(git diff --cached --stat 2>/dev/null)
     if [ -z "$changes" ]; then log "BACKUP: no changes"; release_lock; return 0; fi
-    timeout "$GIT_TIMEOUT" git commit -m "backup: $(date '+%Y-%m-%d %H:%M:%S') - $(find "$LOCAL_DIR/sessions" -name "*.jsonl" 2>/dev/null | wc -l) sessions" 2>/dev/null
+    timeout "$GIT_TIMEOUT" git commit -m "backup: $(date '+%Y-%m-%d %H:%M:%S') - $(sqlite3 "$LOCAL_DIR/memory.db" "SELECT COUNT(*) FROM sessions;" 2>/dev/null || echo 0) sessions" 2>/dev/null
     # Use auth URL for push
     git remote set-url origin "$pull_url" 2>/dev/null
     local push_rc=1
@@ -454,7 +472,7 @@ MIGRATE_EOF
     for f in working_api_key.txt proxy_api_key.txt cf_tunnel_token.txt; do [ -f "$REPO_DIR/tmp-data/$f" ] && cp -f "$REPO_DIR/tmp-data/$f" "/tmp/$f"; done
     [ -d "$REPO_DIR/scripts/glm-proxy" ] && mkdir -p "$GLM_PROXY_DIR" && cp -rf "$REPO_DIR/scripts/glm-proxy/"* "$GLM_PROXY_DIR/" 2>/dev/null
     for f in chat-backup.sh keepalive.sh github-accel.sh auto-restore.sh; do [ -f "$REPO_DIR/scripts/$f" ] && cp -f "$REPO_DIR/scripts/$f" "/root/$f" && chmod +x "/root/$f"; done
-    fix_session_visibility; log "RESTORE: done"; echo "RESTORE: done! sessions=$(find "$LOCAL_DIR/sessions" -name "*.jsonl" | wc -l)"
+    fix_session_visibility; log "RESTORE: done"; echo "RESTORE: done! sessions=$(sqlite3 "$LOCAL_DIR/memory.db" "SELECT COUNT(*) FROM sessions;" 2>/dev/null || echo 0)"
 }
 
 start_glm_proxy() {
@@ -744,7 +762,7 @@ LIST_DATES_PY
 show_status() {
     echo "=== AI Shell Backup Status ==="
     echo "Date: $(date)"
-    echo "Sessions: $(find "$LOCAL_DIR/sessions" -name "*.jsonl" 2>/dev/null | wc -l)"
+    echo "Sessions: $(sqlite3 "$LOCAL_DIR/memory.db" "SELECT COUNT(*) FROM sessions;" 2>/dev/null || echo 0)"
     echo "GLM Proxy: $([ -f "$GLM_PROXY_PID_FILE" ] && kill -0 "$(cat "$GLM_PROXY_PID_FILE")" 2>/dev/null && echo "running (PID $(cat "$GLM_PROXY_PID_FILE"))" || echo "stopped")"
     echo "CF Tunnel: $([ -f "$CF_TUNNEL_PID_FILE" ] && kill -0 "$(cat "$CF_TUNNEL_PID_FILE")" 2>/dev/null && echo "running (PID $(cat "$CF_TUNNEL_PID_FILE"))" || echo "stopped")"
     echo "Last backup: $(tail -1 "$BACKUP_LOG" 2>/dev/null || echo 'N/A')"
